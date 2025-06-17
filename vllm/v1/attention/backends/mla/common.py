@@ -820,6 +820,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         )
 
         self._build_fi_prefill(common_attn_metadata, attn_metadata)
+
         return attn_metadata
 
     def can_run_in_cudagraph(
@@ -919,6 +920,47 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             softmax_scale=softmax_scale,
             **kwargs,
         )
+
+        # Unpack the output if there is multiple results
+        lse = None
+        if isinstance(attn_out, tuple):
+            attn_out, lse = attn_out[0], attn_out[1]
+
+        # Remain consistent with old `flash_attn_varlen_func` where there
+        # is only one output tensor if `return_softmax_lse` is False.
+        if return_softmax_lse:
+            return attn_out, lse
+        return attn_out
+
+    def _fi_prefill_run(self,
+                        q,
+                        k,
+                        v,
+                        attn_metadata: MLACommonMetadata,
+                        return_softmax_lse=False,
+                        softmax_scale=None,
+                        **kwargs):
+        maybe_padded_v = v
+        if self._pad_v:
+            maybe_padded_v = torch.nn.functional.pad(
+                v, [0, q.shape[-1] - v.shape[-1]], value=0)
+
+        attn_out = attn_metadata.fi_prefill.prefill_wrapper.run(
+            q,
+            (k, v),
+            k_scale=self.scale,
+            v_scale=self.scale,
+            return_lse=return_softmax_lse,
+        )
+
+        # attn_out = self.flash_attn_varlen_func(
+        #     q=q,
+        #     k=k,
+        #     v=maybe_padded_v,
+        #     return_softmax_lse=return_softmax_lse,
+        #     softmax_scale=softmax_scale,
+        #     **kwargs,
+        # )
 
         # Unpack the output if there is multiple results
         lse = None
@@ -1071,6 +1113,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         attn_metadata: MLACommonMetadata,
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
+        assert attn_metadata.fi_prefill is not None
 
         has_context = attn_metadata.prefill.chunked_context is not None
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(\
@@ -1080,10 +1123,11 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
-        output = self._flash_attn_varlen_diff_headdims(
+        output = self._fi_prefill_run(
             q=q,
             k=k,
             v=v,
+            attn_metadata=attn_metadata,
             cu_seqlens_q=attn_metadata.prefill.query_start_loc,
             cu_seqlens_k=attn_metadata.prefill.query_start_loc,
             max_seqlen_q=attn_metadata.prefill.max_query_len,
@@ -1092,6 +1136,18 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             causal=True,
             return_softmax_lse=has_context,
         )
+        # output = self._flash_attn_varlen_diff_headdims(
+        #     q=q,
+        #     k=k,
+        #     v=v,
+        #     cu_seqlens_q=attn_metadata.prefill.query_start_loc,
+        #     cu_seqlens_k=attn_metadata.prefill.query_start_loc,
+        #     max_seqlen_q=attn_metadata.prefill.max_query_len,
+        #     max_seqlen_k=attn_metadata.prefill.max_query_len,
+        #     softmax_scale=self.scale,
+        #     causal=True,
+        #     return_softmax_lse=has_context,
+        # )
 
         if has_context:
             suffix_output, suffix_lse = output
