@@ -212,6 +212,8 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.block_table import BlockTable
 
+from vllm.config import VllmConfig, get_layers_from_vllm_config
+
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
     is_vllm_fa = True
@@ -224,6 +226,9 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+from vllm.attention.layer import Attention
+from flashinfer import BatchPrefillWithPagedKVCacheWrapper
 
 logger = init_logger(__name__)
 
@@ -279,6 +284,76 @@ class MLACommonPrefillMetadata:
 
 
 @dataclass
+class FIPrefillMetadata:
+
+    num_actual_tokens: int  # Number of tokens excluding padding.
+
+    # (batch_size + 1,). The cumulative subquery lengths of the sequences in
+    # the batch, used to index into subquery. E.g., if the subquery length
+    # is [4, 6], it is [0, 4, 10].
+    qo_indptr: torch.Tensor
+    # An example for paged_kv_indices, paged_kv_indptr:
+    # request 1, page indices [0, 5, 8]
+    # request 2, page indices [1, 6, 7]
+    # request 3, page indices [3, 4]
+    # paged_kv_indices is a concatenation of page indices of all requests:
+    # [0, 5, 8, 1, 6, 7, 3, 4]
+    # paged_kv_indptr is used to index into paged_kv_indices:
+    # [0, 3, 6, 8]
+    # The indptr of the paged kv cache, shape: [batch_size + 1]
+    paged_kv_indptr: torch.Tensor
+    # The page indices of the paged kv cache
+    paged_kv_indices: torch.Tensor
+    # The number of entries in the last page of each request in
+    # the paged kv cache, shape: [batch_size]
+    paged_kv_last_page_len: torch.Tensor
+    # The number of query/output heads
+    num_qo_heads: int
+    # The number of key/value heads
+    num_kv_heads: int
+    # The dimension of the attention heads
+    head_dim: int
+    # Block size of vllm
+    page_size: int
+    # The data type of the paged kv cache
+    data_type: torch.dtype
+    # The data type of the query
+    q_data_type: torch.dtype
+
+    slot_mapping: torch.Tensor
+
+    # For handling prefill decode split
+    num_decodes: int
+    num_decode_tokens: int
+    num_prefills: int
+    num_prefill_tokens: int
+
+    # For cascade attention.
+    use_cascade: bool
+    shared_qo_indptr: Optional[torch.Tensor] = None
+    shared_kv_page_indptr: Optional[torch.Tensor] = None
+    shared_kv_page_indices: Optional[torch.Tensor] = None
+    shared_kv_last_page_len: Optional[torch.Tensor] = None
+
+    prefill_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
+
+    # @property
+    # def query_start_loc(self):
+    #     # The GPUModelRunner expects to be able to access this property.
+    #     return self.qo_indptr
+
+    # def __post_init__(self):
+    #     # Refer to
+    #     # https://github.com/flashinfer-ai/flashinfer/blob/3d55c71a62052c590c130897d3a3db49b14fcc34/include/flashinfer/utils.cuh#L157
+    #     supported_head_sizes = FlashInferBackend.get_supported_head_sizes()
+    #     if self.head_dim is not None and self.head_dim \
+    #             not in supported_head_sizes:
+    #         raise ValueError(
+    #             f"Only {supported_head_sizes} are supported for head_dim,",
+    #             f" received {self.head_dim}.")
+
+
+@dataclass
 class MLACommonDecodeMetadata:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
@@ -317,6 +392,7 @@ class MLACommonMetadata(Generic[D]):
 
     decode: Optional[D] = None
     prefill: Optional[MLACommonPrefillMetadata] = None
+    fi_prefill: Optional[FIPrefillMetadata] = None
 
     def __post_init__(self):
         supported_head_sizes = MLACommonBackend.get_supported_head_sizes()
@@ -328,6 +404,72 @@ class MLACommonMetadata(Generic[D]):
 
 
 M = TypeVar("M", bound=MLACommonMetadata)
+
+FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
+
+
+@dataclass
+class PerLayerParameters:
+    """
+    Currently, FlashInfer backend only support models in which all layers share
+    the same values for the following hyperparameters.
+    """
+
+    window_left: int
+    logits_soft_cap: Optional[float]
+    sm_scale: float
+
+
+def get_per_layer_parameters(
+        vllm_config: VllmConfig) -> dict[str, PerLayerParameters]:
+    """
+    Scan all attention layers and determine some hyperparameters
+    to use during `plan`.
+    """
+
+    layers = get_layers_from_vllm_config(vllm_config, Attention)
+    per_layer_params: dict[str, PerLayerParameters] = {}
+
+    for key, layer in layers.items():
+        impl = layer.impl
+        assert isinstance(impl, MLACommonImpl)
+
+        # Infer hyperparameters from the attention layer
+        window_size = impl.sliding_window
+        window_left = window_size[0] if window_size is not None else -1
+        logits_soft_cap = impl.logits_soft_cap
+        sm_scale = impl.scale
+
+        per_layer_params[key] = PerLayerParameters(window_left,
+                                                   logits_soft_cap, sm_scale)
+
+    return per_layer_params
+
+
+def infer_global_hyperparameters(
+        per_layer_params: dict[str, PerLayerParameters]) -> PerLayerParameters:
+    """
+    Currently, FlashInfer backend only support models in which all layers share
+    the same values for the following hyperparameters:
+    - `window_left`
+    - `logits_soft_cap`
+    - `sm_scale`
+
+    So this function asserts that all layers share the same values for these
+    hyperparameters and returns the global values.
+    """
+
+    assert len(per_layer_params) > 0, "No attention layers found in the model."
+
+    param_sets = list(per_layer_params.values())
+    global_params = param_sets[0]
+    for params in param_sets:
+        assert params == global_params, (
+            "FlashInfer backend currently only supports models in which all "
+            "layers share the same values for the following hyperparameters: "
+            "`window_left`, `logits_soft_cap`, `sm_scale`.")
+
+    return global_params
 
 
 class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
@@ -383,6 +525,92 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 device=runner.device,
             )
         self.block_table = block_table
+
+        # FI
+        self._workspace_buffer = None
+        self._prefill_wrapper = None  # Wrapper for prefill/append
+        self.global_hyperparameters = None
+
+    def _get_workspace_buffer(self):
+        if self._workspace_buffer is None:
+            self._workspace_buffer = torch.empty(
+                FLASHINFER_WORKSPACE_BUFFER_SIZE,
+                dtype=torch.uint8,
+                device=self.runner.device)
+        return self._workspace_buffer
+
+    def _get_prefill_wrapper(self):
+        if self._prefill_wrapper is None:
+            self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self._get_workspace_buffer(), "NHD")
+        return self._prefill_wrapper
+
+    def _build_fi_prefill(self, common_attn_metadata: CommonAttentionMetadata,
+                          attn_metadata: MLACommonMetadata):
+        if self.global_hyperparameters is None:
+            self.global_hyperparameters = infer_global_hyperparameters(
+                get_per_layer_parameters(self.runner.vllm_config))
+
+        assert attn_metadata.prefill is not None
+        qo_indptr = attn_metadata.prefill.query_start_loc
+        slot_mapping = attn_metadata.slot_mapping
+
+        num_reqs = common_attn_metadata.num_reqs
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
+        assert self._num_decodes + self._num_prefills == num_reqs
+        assert (self._num_decode_tokens +
+                self._num_prefill_tokens == num_actual_tokens)
+
+        page_size = self.kv_cache_spec.block_size
+        device = self.runner.device
+
+        prefill_seq_lens = common_attn_metadata.seq_lens[self._num_decodes:]
+
+        prefill_block_table_bounds = (prefill_seq_lens + page_size -
+                                      1) // page_size
+
+        prefill_block_table = attn_metadata.prefill.block_table
+
+        mask = (torch.arange(prefill_block_table.size(1),
+                             dtype=prefill_block_table.dtype,
+                             device=prefill_block_table.device).unsqueeze(0)
+                < prefill_block_table_bounds.unsqueeze(1))
+        prefill_paged_kv_indices = prefill_block_table[mask]
+
+        prefill_paged_kv_indptr = torch.cat([
+            torch.zeros(1,
+                        dtype=prefill_block_table_bounds.dtype,
+                        device=prefill_block_table_bounds.device),
+            prefill_block_table_bounds.cumsum(dim=0, dtype=torch.int32)
+        ])
+
+        prefill_paged_kv_last_page_len = prefill_seq_lens % page_size
+        prefill_paged_kv_last_page_len = torch.where(
+            prefill_paged_kv_last_page_len == 0, page_size,
+            prefill_paged_kv_last_page_len)
+
+        prefill_wrapper = self._get_prefill_wrapper()
+
+        num_qo_heads = self.runner.num_query_heads
+        num_kv_heads = self.kv_cache_spec.num_kv_heads
+        head_dim = self.kv_cache_spec.head_size
+
+        prefill_wrapper.plan(
+            qo_indptr,
+            prefill_paged_kv_indptr,
+            prefill_paged_kv_indices,
+            prefill_paged_kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=True,
+            sm_scale=self.global_hyperparameters.sm_scale,
+            window_left=self.global_hyperparameters.window_left,
+            logits_soft_cap=self.global_hyperparameters.logits_soft_cap,
+            q_data_type=self.runner.dtype,
+            kv_data_type=self.kv_cache_spec.dtype,
+        )
 
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
@@ -578,7 +806,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 seq_lens=seq_lens[:self._num_decodes],
             )
 
-        return self.metadata_cls(
+        attn_metadata = self.metadata_cls(
             num_actual_tokens=num_actual_tokens,
             query_start_loc=query_start_loc,
             slot_mapping=slot_mapping,
@@ -590,6 +818,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             prefill=prefill_metadata,
             decode=decode_metadata,
         )
+
+        self._build_fi_prefill(common_attn_metadata, attn_metadata)
+        return attn_metadata
 
     def can_run_in_cudagraph(
             self, common_attn_metadata: CommonAttentionMetadata) -> bool:
@@ -659,6 +890,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         self._pad_v = self.vllm_flash_attn_version is None or not (
             self.vllm_flash_attn_version == 3
             and current_platform.get_device_capability()[0] == 9)
+
+        # FI
+        if sliding_window is None:
+            self.sliding_window = (-1, -1)
+        else:
+            self.sliding_window = (sliding_window - 1, 0)
+
+        self.logits_soft_cap = logits_soft_cap
 
     def _flash_attn_varlen_diff_headdims(self,
                                          q,
