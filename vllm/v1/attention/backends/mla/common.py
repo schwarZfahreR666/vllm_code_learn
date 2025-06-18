@@ -405,7 +405,7 @@ class MLACommonMetadata(Generic[D]):
 
 M = TypeVar("M", bound=MLACommonMetadata)
 
-FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
+FLASHINFER_WORKSPACE_BUFFER_SIZE = 1024 * 1024 * 1024
 
 
 @dataclass
@@ -626,9 +626,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             kv_indptr,
             num_qo_heads,
             num_kv_heads,
-            head_dim_qk,
+            192,#head_dim_qk,
             causal=True,
-            head_dim_vo=192,
+            head_dim_vo=128,
 
             # qo_indptr,
             # prefill_paged_kv_indptr,
@@ -954,6 +954,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             and current_platform.get_device_capability()[0] == 9)
         
         # print("!!! _pad_v = {}".format(self._pad_v))
+        self._pad_v = False
         # FI
         if sliding_window is None:
             self.sliding_window = (-1, -1)
