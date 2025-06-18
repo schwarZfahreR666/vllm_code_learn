@@ -336,6 +336,7 @@ class FIPrefillMetadata:
     # shared_kv_last_page_len: Optional[torch.Tensor] = None
 
     prefill_wrapper: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None
+    prefill_wrapper_ctx: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None
 
     # @property
     # def query_start_loc(self):
@@ -405,7 +406,7 @@ class MLACommonMetadata(Generic[D]):
 
 M = TypeVar("M", bound=MLACommonMetadata)
 
-FLASHINFER_WORKSPACE_BUFFER_SIZE = 1024 * 1024 * 1024
+FLASHINFER_WORKSPACE_BUFFER_SIZE = 394 * 1024 * 1024
 
 
 @dataclass
@@ -529,6 +530,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         # FI
         self._workspace_buffer = None
         self._prefill_wrapper = None  # Wrapper for prefill/append
+        self._prefill_wrapper_ctx = []  # Wrapper for prefill/append
         self.global_hyperparameters = None
 
     def _get_workspace_buffer(self):
@@ -543,7 +545,17 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         if self._prefill_wrapper is None:
             self._prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
                 self._get_workspace_buffer(), "NHD")
+
         return self._prefill_wrapper
+
+    def _get_prefill_wrapper_ctx(self, num_chunks):
+        if len(self._prefill_wrapper_ctx) < num_chunks:
+            for _ in range(len(self._prefill_wrapper_ctx), num_chunks):
+                self._prefill_wrapper_ctx.append(
+                    BatchPrefillWithRaggedKVCacheWrapper(
+                        self._get_workspace_buffer(), "NHD"))
+
+        return self._prefill_wrapper_ctx
 
     def _build_fi_prefill(self, common_attn_metadata: CommonAttentionMetadata,
                           attn_metadata: MLACommonMetadata):
@@ -554,7 +566,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         assert attn_metadata.prefill is not None
         qo_indptr = attn_metadata.prefill.query_start_loc
-        
+
         # print("    qo_indptr.shape = {} qo_indptr = {}".format(qo_indptr.shape, qo_indptr))
 
         # slot_mapping = attn_metadata.slot_mapping
@@ -608,17 +620,25 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         prefill_wrapper = self._get_prefill_wrapper()
 
+        has_context = attn_metadata.prefill.chunked_context is not None
+
+        if has_context:
+            num_chunks = attn_metadata.prefill.chunked_context.cu_seq_lens.shape[
+                0]
+            prefill_wrapper_ctx = self._get_prefill_wrapper_ctx(num_chunks)
+        else:
+            prefill_wrapper_ctx = []
         num_qo_heads = self.runner.num_query_heads
         num_kv_heads = self.kv_cache_spec.num_kv_heads
         head_dim_qk = self.kv_cache_spec.head_size
-        
+
         # print("num_qo_heads = {}".format(num_qo_heads))
         # print("num_kv_heads = {}".format(num_kv_heads))
         # print("head_dim_qk = {}".format(head_dim_qk))
         # print("global_hyperparameters.sm_scale = {}".format(self.global_hyperparameters.sm_scale))
         # print("global_hyperparameters.window_left = {}".format(self.global_hyperparameters.window_left))
         # print("global_hyperparameters.logits_soft_cap = {}".format(self.global_hyperparameters.logits_soft_cap))
-        
+
         kv_indptr = qo_indptr.clone()
 
         prefill_wrapper.plan(
@@ -626,7 +646,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             kv_indptr,
             num_qo_heads,
             num_kv_heads,
-            192,#head_dim_qk,
+            192,  #head_dim_qk,
             causal=True,
             head_dim_vo=128,
 
@@ -646,6 +666,38 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             q_data_type=self.runner.dtype,
             kv_data_type=self.kv_cache_spec.dtype,
         )
+
+        if has_context:
+            for i in range(num_chunks):
+                kv_indptr_ctx = attn_metadata.prefill.chunked_context.cu_seq_lens[
+                    i]
+
+                prefill_wrapper_ctx[i].plan(
+                    qo_indptr,
+                    kv_indptr_ctx,
+                    num_qo_heads,
+                    num_kv_heads,
+                    192,  #head_dim_qk,
+                    causal=False,
+                    head_dim_vo=128,
+
+                    # qo_indptr,
+                    # prefill_paged_kv_indptr,
+                    # prefill_paged_kv_indices,
+                    # prefill_paged_kv_last_page_len,
+                    # num_qo_heads,
+                    # num_kv_heads,
+                    # head_dim_qk,
+                    # page_size,
+                    # 128,
+                    # causal=True,
+                    sm_scale=self.global_hyperparameters.sm_scale,
+                    window_left=self.global_hyperparameters.window_left,
+                    logits_soft_cap=self.global_hyperparameters.
+                    logits_soft_cap,
+                    q_data_type=self.runner.dtype,
+                    kv_data_type=self.kv_cache_spec.dtype,
+                )
 
         attn_metadata.fi_prefill = attn_metadata = FIPrefillMetadata(
             # num_actual_tokens=0, #num_actual_tokens,
@@ -670,6 +722,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             # shared_kv_page_indices=None,
             # shared_kv_last_page_len=None,
             prefill_wrapper=prefill_wrapper,
+            prefill_wrapper_ctx=prefill_wrapper_ctx,
         )
 
     def reorder_batch(self, input_batch: "InputBatch",
@@ -952,7 +1005,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         self._pad_v = self.vllm_flash_attn_version is None or not (
             self.vllm_flash_attn_version == 3
             and current_platform.get_device_capability()[0] == 9)
-        
+
         # print("!!! _pad_v = {}".format(self._pad_v))
         self._pad_v = False
         # FI
@@ -1000,7 +1053,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                         k,
                         v,
                         kv_cache,
-                        attn_metadata: MLACommonMetadata,
+                        prefill_wrapper,
                         return_softmax_lse=False,
                         softmax_scale=None,
                         layer=None,
@@ -1017,7 +1070,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         # print("self.scale = {}".format(self.scale))
         # print("return_softmax_lse = {}".format(return_softmax_lse))
-        attn_out = attn_metadata.fi_prefill.prefill_wrapper.run(
+        attn_out = prefill_wrapper.run(
             q,
             k,
             maybe_padded_v,
@@ -1145,19 +1198,40 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))),
                           dim=-1)
 
-            attn_output, attn_softmax_lse = \
-                self._flash_attn_varlen_diff_headdims(
+            print("_compute_prefill_context")
+            print("  q.shape = {}".format(q.shape))
+            print("  k.shape = {}".format(k.shape))
+            print("  v.shape = {}".format(v.shape))
+
+            attn_output, attn_softmax_lse = self._fi_prefill_run(
                 q=q,
                 k=k,
                 v=v,
-                cu_seqlens_q=prefill_metadata.query_start_loc,
-                cu_seqlens_k=prefill_metadata.chunked_context.cu_seq_lens[i],
-                max_seqlen_q=prefill_metadata.max_query_len,
-                max_seqlen_k=prefill_metadata.chunked_context.max_seq_lens[i],
+                kv_cache=kv_c_and_k_pe_cache,
+                prefill_wrapper=attn_metadata.fi_prefill.
+                prefill_wrapper_ctx[i],
+                cu_seqlens_q=attn_metadata.prefill.query_start_loc,
+                cu_seqlens_k=attn_metadata.prefill.query_start_loc,
+                max_seqlen_q=attn_metadata.prefill.max_query_len,
+                max_seqlen_k=attn_metadata.prefill.max_query_len,
                 softmax_scale=self.scale,
-                causal=False,  # Context is unmasked
+                causal=False,
                 return_softmax_lse=True,
+                layer=None,
             )
+            # attn_output, attn_softmax_lse = \
+            #     self._flash_attn_varlen_diff_headdims(
+            #     q=q,
+            #     k=k,
+            #     v=v,
+            #     cu_seqlens_q=prefill_metadata.query_start_loc,
+            #     cu_seqlens_k=prefill_metadata.chunked_context.cu_seq_lens[i],
+            #     max_seqlen_q=prefill_metadata.max_query_len,
+            #     max_seqlen_k=prefill_metadata.chunked_context.max_seq_lens[i],
+            #     softmax_scale=self.scale,
+            #     causal=False,  # Context is unmasked
+            #     return_softmax_lse=True,
+            # )
 
             if output is None:
                 output = attn_output
@@ -1200,12 +1274,17 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         # print("has_context = {}".format(has_context))
 
+        print("_forward_prefill")
+        print("  q.shape = {}".format(q.shape))
+        print("  k.shape = {}".format(k.shape))
+        print("  v.shape = {}".format(v.shape))
+
         output = self._fi_prefill_run(
             q=q,
             k=k,
             v=v,
             kv_cache=kv_c_and_k_pe_cache,
-            attn_metadata=attn_metadata,
+            prefill_wrapper=attn_metadata.fi_prefill.prefill_wrapper,
             cu_seqlens_q=attn_metadata.prefill.query_start_loc,
             cu_seqlens_k=attn_metadata.prefill.query_start_loc,
             max_seqlen_q=attn_metadata.prefill.max_query_len,
@@ -1229,8 +1308,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         # )
 
         if has_context:
-            assert False, "has_context is True"
-            
             suffix_output, suffix_lse = output
             context_output, context_lse = self._compute_prefill_context( \
                 q, kv_c_and_k_pe_cache, attn_metadata)
