@@ -564,6 +564,8 @@ class FlashInferImpl(AttentionImpl):
         """
         assert output is not None, "Output tensor must be provided."
 
+        print("kv_cache.shape = {}".format(kv_cache.shape))
+        
         if output_scale is not None:
             raise NotImplementedError(
                 "fused output quantization is not yet supported"
