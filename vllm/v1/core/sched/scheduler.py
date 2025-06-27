@@ -166,7 +166,7 @@ class Scheduler(SchedulerInterface):
         )
 
     def schedule(self) -> SchedulerOutput:
-        # 统一调度prefill、decode以及chunked prefill的目标
+        # 统一调度prefill、decode以及chunked prefill的目标任务
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
