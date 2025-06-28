@@ -2474,6 +2474,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             corresponding memory buffer for KV cache.
         """
         # Initialize the memory buffer for KV cache
+        # 使用torch.zeros申请tensor
         kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config,

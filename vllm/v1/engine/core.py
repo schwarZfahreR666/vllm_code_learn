@@ -135,14 +135,43 @@ class EngineCore:
         start = time.time()
 
         # Get all kv cache needed by the model
+        # ===================================================================================
+        # 1、计算对于当前模型，各个worker的各个layer上，attn模块相关的kv cache元数据。
+        # kv_cache_specs：List[Dict[str, KVCacheSpec]]，每一个dict对应一个worker的返回结果：
+        #                - str：模型某一层的layer_name
+        #                - KVCacheSpec：维护在该worker上的、这一层layer的kv cache相关元信息
+        #                              包括 num_heads, head_size，dtype, use_mla等信息
+        #               （注意，这里仅记录元信息，没有实际执行kv cache的分配！）
+        # - 执行流程：【Executor.get_kv_cache_specs】
+        #           -> 【 MultiProcExecutor.collective_rpc 】：
+        #              Executor触发所有worker执行get_kv_cache_specs，并收集相关结果
+        #           -> 【 GPUModelRunner.get_kv_cache_specs 】：
+        #              Worker上的 ModelRunner 负责实际执行命令
+        #           -> 【 MultiProcExecutor.collective_rpc 】：
+        #              Executor收集各个workers上的结果
+        # ===================================================================================
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
         # Profiles the peak memory usage of the model to determine how much
         # memory can be allocated for kv cache.
+        # ===================================================================================
+        # 2、profiling：模拟执行1次前向计算，统计各个worker（卡）上有多少空间可以留给kv cache
+        # 调用runner的profile_run()方法
+        # available_gpu_memory：List[float]，每个元素代表一个worker（卡）的返回结果
+        # 每块卡上可分配给kv cache的显存 = 该卡总显存 * 用户设置的显存利用率 - fwd推理过程中的峰值显存
+        # ===================================================================================
         available_gpu_memory = self.model_executor.determine_available_memory()
 
         assert len(kv_cache_specs) == len(available_gpu_memory)
         # Get the kv cache tensor size
+        # ===================================================================================
+        # 3、计算每块卡上的kv cache配置
+        # kv_cache_configs：List[KVCacheConfig]，包含每块gpu上的：
+        # - num_blocks：可分配的block数量，floor(可用显存 / 单块缓存大小)
+        # - block_size：每块缓存的 token 容量
+        # - cache_dtype：数据类型
+        # - 等等
+        # ===================================================================================
         kv_cache_configs = [
             get_kv_cache_config(vllm_config, kv_cache_spec_one_worker,
                                 available_gpu_memory_one_worker)
@@ -150,9 +179,12 @@ class EngineCore:
             zip(kv_cache_specs, available_gpu_memory)
         ]
 
+        # ==================================================================================
+        # 4、统一各卡上的kv cache config，例如取 min(num_blocks) 作为最终各卡上可以维护的block数量
         # Since we use a shared centralized controller, we need the
         # `kv_cache_config` to be consistent across all workers to make sure
         # all the memory operators can be applied to all workers.
+        # ==================================================================================
         unify_kv_cache_configs(kv_cache_configs)
 
         # All workers have the same kv_cache_config except layer names, so use
@@ -161,11 +193,15 @@ class EngineCore:
             cfg.num_blocks == kv_cache_configs[0].num_blocks
             for cfg in kv_cache_configs
         ])
-        num_gpu_blocks = kv_cache_configs[0].num_blocks
-        num_cpu_blocks = 0
+        num_gpu_blocks = kv_cache_configs[0].num_blocks # 最终确定的每张卡上的block数量
+        num_cpu_blocks = 0  # 最终确定的cpu上的block数量
         scheduler_kv_cache_config = kv_cache_configs[0]
 
+        # ==================================================================================
+        # 5、在各张卡上实际分配 KV cache（用0张量填充kv cache）
+        # 实际调用modelRunner的initialize_kv_cache方法
         # Initialize kv cache and warmup the execution
+        # ==================================================================================
         self.model_executor.initialize_from_config(kv_cache_configs)
 
         elapsed = time.time() - start
