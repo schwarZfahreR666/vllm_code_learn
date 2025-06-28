@@ -72,10 +72,14 @@ class Request:
         else:
             raise ValueError(
                 "sampling_params and pooling_params can't both be unset")
-
+        # 提示词token序列，在整个req的生命周期中保持不变
         self.prompt_token_ids = prompt_token_ids
         self.num_prompt_tokens = len(self.prompt_token_ids)
+        # 模型生成的token序列，每次生成新token后，在scheduler.update_from_output中更新
         self._output_token_ids: list[int] = []
+        # prompt_token_ids + output_token_ids
+        # 请求中所有token的集合
+        # 在append_output_token_ids函数更新
         self._all_token_ids: list[int] = self.prompt_token_ids.copy()
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0

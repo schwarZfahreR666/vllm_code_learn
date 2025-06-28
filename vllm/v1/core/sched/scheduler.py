@@ -166,7 +166,7 @@ class Scheduler(SchedulerInterface):
         )
 
     def schedule(self) -> SchedulerOutput:
-        # 统一调度prefill、decode以及chunked prefill的目标任务
+        # 统一调度prefill、decode、spec decode以及chunked prefill的目标任务
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -191,7 +191,9 @@ class Scheduler(SchedulerInterface):
         # uses structured decoding.
         structured_output_request_ids: dict[str, int] = {}
 
+        # request_id到新为其分配的kv block的映射
         req_to_new_block_ids: dict[str, tuple[list[int], ...]] = {}
+        # 每个请求调度的token数量
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
@@ -207,17 +209,21 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-
+            # 计算需要处理的新token数量，包括实际token和spec decode token的总和
+            # num_tokens_with_spec = len(self._all_token_ids) + len(self.spec_token_ids)
             num_new_tokens = (request.num_tokens_with_spec -
                               request.num_computed_tokens)
+            # 应用prefill阈值限制
             if (0 < self.scheduler_config.long_prefill_token_threshold <
                     num_new_tokens):
                 num_new_tokens = (
                     self.scheduler_config.long_prefill_token_threshold)
+            # 本次能调度的新token数要在预算内
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
+            # 不能超过用户设置的最大模型长度
             num_new_tokens = min(
                 num_new_tokens,
                 self.max_model_len - request.num_computed_tokens)
@@ -248,13 +254,14 @@ class Scheduler(SchedulerInterface):
             num_draft_tokens = max(
                 num_new_tokens + request.num_computed_tokens -
                 request.num_tokens, 0)
-
+            # 这里为什么要用while true，限定作用域吗？
             while True:
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
                     num_draft_tokens=num_draft_tokens,
                     num_lookahead_tokens=self.num_lookahead_tokens)
+                # 分配kv cache不成功，执行抢占
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -263,10 +270,12 @@ class Scheduler(SchedulerInterface):
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
+                        # 抢占running队列中优先级最低的req
                         self.running.remove(preempted_req)
                     else:
+                        # 抢占running队列最后面的req
                         preempted_req = self.running.pop()
-
+                    # 释放全部资源，并且加入到waiting队列
                     self.kv_cache_manager.free(preempted_req)
                     preempted_req.status = RequestStatus.PREEMPTED
                     preempted_req.num_computed_tokens = 0
@@ -276,6 +285,7 @@ class Scheduler(SchedulerInterface):
 
                     self.waiting.prepend_request(preempted_req)
                     preempted_reqs.append(preempted_req)
+                    # 没有其他请求可被抢占，该rep不能被调度
                     if preempted_req == request:
                         # No more request to preempt.
                         can_schedule = False
@@ -296,6 +306,7 @@ class Scheduler(SchedulerInterface):
                 # Therefore, we might introduce some additional
                 # cycle to fill in the bitmask, which could be a big no-op.
                 structured_output_request_ids[request.request_id] = req_index
+            # 填写该req的调度结果
             req_to_new_block_ids[request.request_id] = (
                 new_blocks.get_block_ids())
             num_scheduled_tokens[request.request_id] = num_new_tokens
@@ -322,6 +333,8 @@ class Scheduler(SchedulerInterface):
                     self.encoder_cache_manager.allocate(request, i)
                 encoder_budget = new_encoder_budget
 
+        # 到此为止，调度完running队列了
+
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -335,19 +348,23 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
+        # 没有被抢占的req，说明还有预算，可以调度waiting队列
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
+                # 如果running队列中req达到上限，就停止调度
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
                 request = self.waiting.peek_request()
 
                 # KVTransfer: skip request if still waiting for remote kvs.
+                # 还在等待传输远程kv，更新下状态，如果reday了，就把该req改为WAITING
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
                     if is_ready:
                         request.status = RequestStatus.WAITING
                     else:
+                        # 如果不ready，本次调度跳过该req
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id)
@@ -382,6 +399,7 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
+                    # 从kv cache中查找是否有能复用的token
                     new_computed_blocks, num_new_local_computed_tokens = \
                         self.kv_cache_manager.get_computed_blocks(
                             request)
@@ -397,6 +415,7 @@ class Scheduler(SchedulerInterface):
                                            num_external_computed_tokens)
                 # KVTransfer: WAITING reqs have num_computed_tokens > 0
                 # after async KV recvs are completed.
+                # 在什么情况下waiting队列中的req已经计算的token数不为0呢？
                 else:
                     new_computed_blocks = (
                         self.kv_cache_manager.create_empty_block_list())
@@ -468,6 +487,7 @@ class Scheduler(SchedulerInterface):
 
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
+                # req调度完成，可以从waiting队列中弹出了
                 request = self.waiting.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
@@ -480,13 +500,16 @@ class Scheduler(SchedulerInterface):
                     structured_output_request_ids[request.request_id] = (
                         req_index)
                 req_index += 1
+                # 把该req添加到running队列中
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
                 if request.status == RequestStatus.WAITING:
+                    # 新req调度到running
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
+                    # 被抢占的req重新调度到running
                     scheduled_resumed_reqs.append(request)
                 else:
                     raise RuntimeError(
@@ -494,6 +517,8 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
+                
+                # 填写调度结果
                 req_to_new_block_ids[request.request_id] = (
                     self.kv_cache_manager.get_block_ids(request.request_id))
                 num_scheduled_tokens[request.request_id] = num_new_tokens
@@ -502,6 +527,7 @@ class Scheduler(SchedulerInterface):
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
+                    # 记录一下有多少token是复用的之前cache的
                     request.num_cached_tokens = num_computed_tokens
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
@@ -511,9 +537,11 @@ class Scheduler(SchedulerInterface):
                     for i in encoder_inputs_to_schedule:
                         self.encoder_cache_manager.allocate(request, i)
                     encoder_budget = new_encoder_budget
+        # 至此完成waiting队列的调度
 
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
+            # 把跳过的req放回waiting队列
             self.waiting.prepend_requests(skipped_waiting_requests)
 
         # Check if the scheduling constraints are satisfied.
@@ -533,6 +561,7 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_config.kv_cache_groups)
         if self.running:
             any_request = self.running[0]
+            # 计算所有req共享的prefix cached token数目
             num_common_prefix_blocks = (
                 self.kv_cache_manager.get_num_common_prefix_blocks(
                     any_request, len(self.running)))
@@ -566,6 +595,7 @@ class Scheduler(SchedulerInterface):
                 resumed_from_preemption=False,
             ) for req in scheduled_running_reqs
         ]
+        # 构建返回值
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=resumed_reqs_data + running_reqs_data,
@@ -798,6 +828,7 @@ class Scheduler(SchedulerInterface):
             # a request is still being prefilled, we expect the model runner
             # to return empty token ids for the request.
             for num_new, output_token_id in enumerate(new_token_ids, 1):
+                #更新token数量
                 request.append_output_token_ids(output_token_id)
 
                 # Check for stop and update request state.
