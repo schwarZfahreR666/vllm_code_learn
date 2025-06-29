@@ -496,7 +496,9 @@ class MessageQueue:
         serialized_obj = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
         if self.n_local_reader > 0:
             if len(serialized_obj) >= self.buffer.max_chunk_bytes:
+                # 如果data大小大于设定阈值，则使用zmq发出data
                 with self.acquire_write(timeout) as buf:
+                    # 标记要写的queue的这个位置为1表示溢出，用在zmq发送此数据
                     buf[0] = 1  # overflow
                 self.local_socket.send(serialized_obj)
             else:
