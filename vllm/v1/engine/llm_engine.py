@@ -37,7 +37,7 @@ logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
 
-
+# v1代码的入口
 class LLMEngine:
     """Legacy LLMEngine for backwards compatibility."""
 
@@ -89,6 +89,10 @@ class LLMEngine:
             lora_config=vllm_config.lora_config)
 
         # Processor (convert Inputs --> EngineCoreRequests)
+        # 作用是对req进行预处理：
+        # 1.Tokenize
+        # 2.验证输入参数合法性
+        # 3.将req封装成特定形式，如EngineCoreRequest等
         self.processor = Processor(vllm_config=vllm_config,
                                    tokenizer=self.tokenizer,
                                    mm_registry=mm_registry)
@@ -98,6 +102,8 @@ class LLMEngine:
                                                 log_stats=self.log_stats)
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
+        # 运行在process1，EngineCoreClient是客户端实现的父类
+        # 根据配置创建不同的client
         self.engine_core = EngineCoreClient.make_client(
             multiprocess_mode=multiprocess_mode,
             asyncio_mode=False,
@@ -223,12 +229,36 @@ class LLMEngine:
 
     def step(self) -> Union[list[RequestOutput], list[PoolingRequestOutput]]:
 
+        """
+        should_execute_dummy_batch核心目的：为了在dp场景下保证worker的SPMD
+            1. 数据并行同步
+                在数据并行环境中，当某个节点没有未完成的请求，但其他节点还有未完成请求时
+                需要让没有工作的节点执行一个虚拟批次，以保持所有节点的同步
+            2. 避免死锁
+                防止某些节点因为没有工作而提前退出，导致其他节点等待
+                确保所有数据并行节点保持同步状态
+            3. 资源管理
+                虚拟批次执行 _dummy_run(1)，只处理1个token
+                这是一个轻量级的操作，主要用于同步而不是实际计算
+            执行流程：
+                检查状态 → 某个节点没有未完成请求
+                全局同步 → 发现其他节点还有未完成请求
+                设置标志 → should_execute_dummy_batch = True
+                执行虚拟批次 → 调用 execute_dummy_batch()
+                重置标志 → should_execute_dummy_batch = False
+            实际效果：
+                性能影响：最小化，因为虚拟批次只处理1个token
+                同步效果：确保所有数据并行节点保持同步
+                资源利用：避免某些节点空闲而其他节点忙碌的不平衡状态
+                这个机制是vLLM在数据并行环境中保证系统稳定性和性能的重要组件。
+        """
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
             self.engine_core.execute_dummy_batch()
             return []
 
         # 1) Get EngineCoreOutput from the EngineCore.
+        # 此时直接获取输出，因为真正的schedule和execute在EngineCoreProc线程的EngineCore.step()中执行
         outputs = self.engine_core.get_output()
 
         # 2) Process EngineCoreOutputs.

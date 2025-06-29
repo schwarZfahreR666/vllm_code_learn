@@ -39,7 +39,7 @@ logger = init_logger(__name__)
 
 
 class MultiprocExecutor(Executor):
-
+    # 会被基类构造函数调用
     def _init_executor(self) -> None:
         # Call self.shutdown at exit to clean up
         # and ensure workers will be terminated.
@@ -69,6 +69,7 @@ class MultiprocExecutor(Executor):
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
+        # 初始化广播队列，zmq socket也在其中初始化
         self.rpc_broadcast_mq = MessageQueue(self.world_size,
                                              self.world_size,
                                              max_chunk_bytes=max_chunk_bytes)
@@ -79,6 +80,7 @@ class MultiprocExecutor(Executor):
         success = False
         try:
             for rank in range(self.world_size):
+                # 创建world_size个worker进程
                 unready_workers.append(
                     WorkerProc.make_worker_process(
                         vllm_config=self.vllm_config,
