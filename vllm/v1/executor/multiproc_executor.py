@@ -39,7 +39,7 @@ logger = init_logger(__name__)
 
 
 class MultiprocExecutor(Executor):
-
+    # 会被基类构造函数调用
     def _init_executor(self) -> None:
         # Call self.shutdown at exit to clean up
         # and ensure workers will be terminated.
@@ -69,6 +69,7 @@ class MultiprocExecutor(Executor):
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
+        # 初始化广播队列，zmq socket也在其中初始化
         self.rpc_broadcast_mq = MessageQueue(self.world_size,
                                              self.world_size,
                                              max_chunk_bytes=max_chunk_bytes)
@@ -79,6 +80,7 @@ class MultiprocExecutor(Executor):
         success = False
         try:
             for rank in range(self.world_size):
+                # 创建world_size个worker进程
                 unready_workers.append(
                     WorkerProc.make_worker_process(
                         vllm_config=self.vllm_config,
@@ -347,6 +349,7 @@ class WorkerProc:
         _add_prefix(sys.stderr, f"VllmWorker rank={rank}", pid)
 
         # Initialize MessageQueue for receiving SchedulerOutput
+        # 每个worker一个queue，只有shmring是共享的
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(
             input_shm_handle, self.worker.rank)
 
@@ -354,7 +357,9 @@ class WorkerProc:
         self.worker_response_mq = MessageQueue(1, 1)
 
         # Initialize device and loads weights
+        # 绑定device并初始化分布式环境
         self.worker.init_device()
+        # 调用WorkerWrapper.load_model()，加载模型权重分片
         self.worker.load_model()
 
     @staticmethod
@@ -461,6 +466,9 @@ class WorkerProc:
             worker = WorkerProc(*args, **kwargs)
 
             # Send READY once we know everything is loaded
+            # 通过ready_pipe发送worker的ready状态，
+            # 并且把worker_response_mq的handle发过去
+            # Executor在等所有worker的这个状态
             ready_writer.send({
                 "status":
                 WorkerProc.READY_STR,
