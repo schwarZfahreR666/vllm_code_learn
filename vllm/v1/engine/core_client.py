@@ -430,7 +430,6 @@ class MPClient(EngineCoreClient):
                 self.ctx, output_address, zmq.PULL)
 
             if client_addresses is None:
-				# 启动local_engine_count个执行EngineCoreProc.run_engine_core的进程
                 self._init_engines_direct(vllm_config, local_only,
                                           local_start_index, input_address,
                                           output_address, executor_class,
@@ -570,7 +569,6 @@ class SyncMPClient(MPClient):
 
     def __init__(self, vllm_config: VllmConfig, executor_class: type[Executor],
                  log_stats: bool):
-        # 这里初始化EngineCoreProc以及Executor
         super().__init__(
             asyncio_mode=False,
             vllm_config=vllm_config,
