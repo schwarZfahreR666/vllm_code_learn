@@ -349,6 +349,7 @@ class WorkerProc:
         _add_prefix(sys.stderr, f"VllmWorker rank={rank}", pid)
 
         # Initialize MessageQueue for receiving SchedulerOutput
+        # 每个worker一个queue，只有shmring是共享的
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(
             input_shm_handle, self.worker.rank)
 
@@ -356,7 +357,9 @@ class WorkerProc:
         self.worker_response_mq = MessageQueue(1, 1)
 
         # Initialize device and loads weights
+        # 绑定device并初始化分布式环境
         self.worker.init_device()
+        # 调用WorkerWrapper.load_model()，加载模型权重分片
         self.worker.load_model()
 
     @staticmethod
@@ -463,6 +466,9 @@ class WorkerProc:
             worker = WorkerProc(*args, **kwargs)
 
             # Send READY once we know everything is loaded
+            # 通过ready_pipe发送worker的ready状态，
+            # 并且把worker_response_mq的handle发过去
+            # Executor在等所有worker的这个状态
             ready_writer.send({
                 "status":
                 WorkerProc.READY_STR,

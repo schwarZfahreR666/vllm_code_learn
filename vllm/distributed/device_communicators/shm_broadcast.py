@@ -73,6 +73,7 @@ class ShmRingBuffer:
                  max_chunks: int,
                  name: Optional[str] = None):
         """
+        一写多读的环形队列
         A shared memory ring buffer implementation for broadcast communication.
         Essentially, it is a queue where only one will `enqueue` and multiple
         will `dequeue`. The max size of each item, together with the max number
@@ -127,12 +128,14 @@ class ShmRingBuffer:
         self.max_chunks = max_chunks
         self.total_bytes_of_buffer = (self.max_chunk_bytes +
                                       self.metadata_size) * self.max_chunks
+        # data在整块内存空间前部分，所有metadata在整块空间后面
         self.data_offset = 0
         self.metadata_offset = self.max_chunk_bytes * self.max_chunks
 
         if name is None:
             # we are creating a buffer
             self.is_creator = True
+            # 申请指定大小的共享内存
             self.shared_memory = shared_memory.SharedMemory(
                 create=True, size=self.total_bytes_of_buffer)
             # initialize the metadata section to 0
@@ -180,6 +183,7 @@ class ShmRingBuffer:
 
     @contextmanager
     def get_data(self, current_idx: int):
+        # 根据索引取data
         start = self.data_offset + current_idx * self.max_chunk_bytes
         end = start + self.max_chunk_bytes
         with memoryview(self.shared_memory.buf[start:end]) as buf:
@@ -187,6 +191,7 @@ class ShmRingBuffer:
 
     @contextmanager
     def get_metadata(self, current_idx: int):
+        # 根据索引取metadata
         start = self.metadata_offset + current_idx * self.metadata_size
         end = start + self.metadata_size
         with memoryview(self.shared_memory.buf[start:end]) as buf:
@@ -401,7 +406,7 @@ class MessageQueue:
                     if (timeout is not None
                             and time.monotonic() - start_time > timeout):
                         raise TimeoutError
-
+                    # 重新走此判断流程，保证当前idx的chunk确实可写
                     continue
                 # found a block that is either
                 # (1) not written
@@ -412,7 +417,7 @@ class MessageQueue:
                 # let caller write to the buffer
                 with self.buffer.get_data(self.current_idx) as buf:
                     yield buf
-
+                # 类似gennerator，重新回到这里的时候，上一个chunk已经写完了
                 # caller has written to the buffer
                 # NOTE: order is important here
                 # first set the read flags to 0
@@ -423,6 +428,7 @@ class MessageQueue:
                     metadata_buffer[i] = 0
                 # mark the block as written
                 metadata_buffer[0] = 1
+                # 当前current_idx加一，作此操作的前提是写入了新的内容
                 self.current_idx = (self.current_idx +
                                     1) % self.buffer.max_chunks
                 break
@@ -436,6 +442,7 @@ class MessageQueue:
         n_warning = 1
         while True:
             with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+                # 只取本rank的read_flag
                 read_flag = metadata_buffer[self.local_reader_rank + 1]
                 written_flag = metadata_buffer[0]
                 if not written_flag or read_flag:
