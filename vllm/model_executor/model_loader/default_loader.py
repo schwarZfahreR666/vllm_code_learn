@@ -239,8 +239,13 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # 这一步返回结果是一个权重迭代器，形式如(权重名称, tensor)，
+        # 比如("model.layers.0.self_attn.q_proj.weight", tensor)，
+        # 需要注意的是，这是一个不切割的完整权重，
+        # 它将会被完整地交给这个ModelRunner上维护的model，
+        # 然后model会根据分布式配置，决定要怎么读取这个模型。
         primary_weights = DefaultModelLoader.Source(
-            model_config.model,
+            model_config.model , # 模型名字字符串
             model_config.revision,
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load",
@@ -248,6 +253,9 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides",
                                              None),
         )
+        # 返回权重迭代器
+        # yield from 用于从可迭代对象中依次产出所有元素。
+        # 你可以对元组（tuple） 使用 yield from，它会逐个把元组中的元素 yield 出来
         yield from self._get_weights_iterator(primary_weights)
 
         secondary_weights = cast(
@@ -265,7 +273,17 @@ class DefaultModelLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
+        # 获取要加载的权重的名字
         weights_to_load = {name for name, _ in model.named_parameters()}
+        # ==========================================================================
+        # 2. 实际加载权重
+        # (1) _get_all_weights：生成权重迭代器，形式如（权重名称 ,tensor）
+        #     - 下载权重到本地
+        #     - 生成权重迭代器，形式如（权重名称 ,tensor），迭代器的作用是，先不去加载权重，
+        #       到第二步 model.loads_weights时，遍历到哪一块权重，再具体去加载      
+        # (2) model.load_weights：真正将模型权重注入本卡上所维护的模型切片中，在注入的过程中，
+        #                         如有需要，会对送来的这部分权重进行切片
+        # ==========================================================================
         loaded_weights = model.load_weights(
             self.get_all_weights(model_config, model))
         self.counter_after_loading_weights = time.perf_counter()

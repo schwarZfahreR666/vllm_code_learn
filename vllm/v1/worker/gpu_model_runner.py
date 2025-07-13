@@ -1725,9 +1725,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         logger.info("Starting to load model %s...", self.model_config.model)
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             time_before_load = time.perf_counter()
+            # =================================================================
+            # 核心代码：在这一步完成了：
+            # （1）权重下载（如有必要）
+            # （2）模型架构初始化（每个ModelRunner上维护着自己的切片架构）
+            # （3）权重注入模型架构（一般权重是完整的，在注入模型架构的时候，每个ModelRunner
+            #                    读取自己需要的那部分切片）
+            # =================================================================
+            # 默认情况下(LoadFormat.Auto)，loader = DefaultModelLoader
             model_loader = get_model_loader(self.load_config)
             if not hasattr(self, "model"):
                 logger.info("Loading model from scratch...")
+                # 最终返回的结果，self.model = model.eval()
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config,
                     model_config=self.model_config)

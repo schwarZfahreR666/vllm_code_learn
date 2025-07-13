@@ -49,6 +49,7 @@ def initialize_model(
     if model_config is None:
         model_config = vllm_config.model_config
     if model_class is None:
+        # 获取模型nn.Module类
         model_class, _ = get_model_architecture(model_config)
 
     if vllm_config.quant_config is not None:

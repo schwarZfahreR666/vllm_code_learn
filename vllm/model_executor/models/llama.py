@@ -427,6 +427,8 @@ class LlamaModel(nn.Module):
                 (scale_name := self.quant_config.get_cache_scale(name))):
                 # Loading kv cache quantization scales
                 param = params_dict[scale_name]
+                # weight_loader就是将数据从weight中用各种办法(例如fill或者copy)
+                # 加载到param中
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else

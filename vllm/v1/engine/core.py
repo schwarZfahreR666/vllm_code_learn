@@ -267,6 +267,7 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        # 调用调度器单步调度
         scheduler_output = self.scheduler.schedule()
         # 调用executor
         model_output = self.execute_model(scheduler_output)
@@ -302,9 +303,10 @@ class EngineCore:
             scheduler_output = self.scheduler.schedule()
             if scheduler_output.total_num_scheduled_tokens > 0:
                 future = self.model_executor.execute_model(scheduler_output)
+                # 记录执行的任务future
                 self.batch_queue.put_nowait(
                     (future, scheduler_output))  # type: ignore
-
+        # 有任务调度运行则为true
         scheduled_batch = (scheduler_output is not None
                            and scheduler_output.total_num_scheduled_tokens > 0)
 
@@ -314,6 +316,8 @@ class EngineCore:
         # job queue to check if it's finished before scheduling a new batch,
         # but peeking the first element in a queue is not thread-safe,
         # so we need more work.
+        # 如果没法再调度任务了，并且batch_queue不为空，则在此阻塞等待已调度任务完成
+        # 否则将继续执行上面调度任务的过程
         if not scheduled_batch and not self.batch_queue.empty():
             future, scheduler_output = self.batch_queue.get_nowait()
             # Blocking until the first result is available.
@@ -583,7 +587,17 @@ class EngineCoreProc(EngineCore):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
+            # =================================================================================
+            # 从input_queue中获取request数据(阻塞式取出)
+            # 阻塞取出：当input_queue为空，且不设置timeout的情况下，会持续等待直到可以从
+            #         input_queue中取到请求
+            # =================================================================================
             req = self.input_queue.get()
+            # =================================================================================
+            # 处理请求，具体包括：
+            # 1、将请求包装成Request形式（EngineCoreRequest -> Request）
+            # 2、将请求添加进Scheduler的waiting队列中
+            # =================================================================================
             self._handle_client_request(*req)
 
         if waited:
